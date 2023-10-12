@@ -2,6 +2,13 @@ import torch
 import einops
 import math
 import diffusers
+from functools import partial
+import math
+from typing import Optional, NamedTuple, List
+import torch
+from torch import Tensor
+from torch.utils.checkpoint import checkpoint
+from sub_quadratic_attention import efficient_dot_product_attention # pylint: disable=relative-beyond-top-level
 
 HAVE_XFORMERS = False
 try:
@@ -64,7 +71,8 @@ def get_available():
         use_doggettx_attention,
         use_flash_attention,
         use_diffusers_attention,
-        use_sdp_attention
+        use_sdp_attention,
+        use_quad_attention
     ]
     if HAVE_XFORMERS:
         available += [use_xformers_attention]
@@ -90,6 +98,94 @@ def exists(val):
 
 def default(val, d):
     return val if exists(val) else d
+    
+def use_quad_attention(device):
+    def get_available_vram(device):
+            stats = torch.cuda.memory_stats(device)
+            mem_active = stats['active_bytes.all.current']
+            mem_reserved = stats['reserved_bytes.all.current']
+            mem_free_cuda, _ = torch.cuda.mem_get_info(torch.cuda.current_device())
+            mem_free_torch = mem_reserved - mem_active
+            mem_free_total = mem_free_cuda + mem_free_torch
+            return mem_free_total
+            
+    def sub_quad_attention_forward(self, x, encoder_hidden_states=None, attention_mask=None, **cross_attention_kwargs):
+
+        h = self.heads
+
+        q = self.to_q(x)
+        
+        context = default(encoder_hidden_states, x)
+
+        context = context if context is not None else x
+        context = context.to(x.dtype)
+        
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        del context, x
+
+        q = q.unflatten(-1, (h, -1)).transpose(1,2).flatten(end_dim=1)
+        k = k.unflatten(-1, (h, -1)).transpose(1,2).flatten(end_dim=1)
+        v = v.unflatten(-1, (h, -1)).transpose(1,2).flatten(end_dim=1)
+        
+        dtype = q.dtype
+        device = q.device
+
+        if q.device.type == 'mps':
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+
+        dtype = q.dtype
+        if cross_attention_kwargs.get('upcast_attention', False):
+            q, k = q.float(), k.float()
+
+        x = sub_quad_attention(q, k, v, q_chunk_size=512, kv_chunk_size=512, chunk_threshold=80, use_checkpoint=False)
+
+        x = x.to(dtype)
+
+        x = x.unflatten(0, (-1, h)).transpose(1,2).flatten(start_dim=2)
+
+        out_proj, dropout = self.to_out
+        x = out_proj(x)
+        x = dropout(x)
+
+        return x
+
+    def sub_quad_attention(q, k, v, q_chunk_size=1024, kv_chunk_size=None, kv_chunk_size_min=None, chunk_threshold=None, use_checkpoint=True):
+        bytes_per_token = torch.finfo(q.dtype).bits//8
+        batch_x_heads, q_tokens, _ = q.shape
+        _, k_tokens, _ = k.shape
+        qk_matmul_size_bytes = batch_x_heads * bytes_per_token * q_tokens * k_tokens
+
+        if chunk_threshold is None:
+            chunk_threshold_bytes = int(get_available_vram(device) * 0.9) if q.device.type == 'mps' else int(get_available_vram(device) * 0.7)
+        elif chunk_threshold == 0:
+            chunk_threshold_bytes = None
+        else:
+            chunk_threshold_bytes = int(0.01 * chunk_threshold * get_available_vram(device))
+
+        if kv_chunk_size_min is None and chunk_threshold_bytes is not None:
+            kv_chunk_size_min = chunk_threshold_bytes // (batch_x_heads * bytes_per_token * (k.shape[2] + v.shape[2]))
+        elif kv_chunk_size_min == 0:
+            kv_chunk_size_min = None
+
+        if chunk_threshold_bytes is not None and qk_matmul_size_bytes <= chunk_threshold_bytes:
+            # the big matmul fits into our memory limit; do everything in 1 chunk,
+            # i.e. send it down the unchunked fast-path
+            kv_chunk_size = k_tokens
+
+#        with devices.without_autocast(disable=q.dtype == v.dtype):
+        return efficient_dot_product_attention(
+            q,
+            k,
+            v,
+            query_chunk_size=q_chunk_size,
+            kv_chunk_size=kv_chunk_size,
+            kv_chunk_size_min = kv_chunk_size_min,
+            use_checkpoint=use_checkpoint,
+        )
+            
+    set_attention(sub_quad_attention_forward)
 
 def use_doggettx_attention(device):
     if not "cuda" in str(device):

@@ -92,7 +92,8 @@ CROSS_ATTENTION = {
     "Flash": attention.use_flash_attention,
     "Original": attention.use_diffusers_attention,
     "SDP": attention.use_sdp_attention,
-    "XFormers": attention.use_xformers_attention
+    "XFormers": attention.use_xformers_attention,
+    "Quad": attention.use_quad_attention
 }
 
 FP32_DEVICES = ["1660", "1650", "1630", "T500", "T550", "T600", "MX550", "MX450", "CMP 30HX"]

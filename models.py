@@ -212,7 +212,7 @@ class CLIP(torch.nn.Module):
             clip = CLIP(model_type, dtype)
             missing, _ = clip.model.load_state_dict(state_dict, strict=False)
         if missing:
-            raise ValueError("missing keys in CLIP: " + ", ".join(missing))
+            print("missing keys in CLIP: " + ", ".join(missing))
 
         clip.additional = AdditionalNetworks(clip.model)
         return clip
